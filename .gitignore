@@ -1,0 +1,34 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+.build-venv/
+
+# Build artifacts
+build/
+dist/
+scripts/build/
+scripts/dist/
+
+# Installer / packaging outputs
+*.dmg
+*.pkg
+*.app/
+*.exe
+*.msi
+PriceTracker.spec
+PriceTracker-*.spec
+
+# Local runtime config
+settings.json
+settings.*.json
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
