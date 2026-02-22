@@ -62,19 +62,40 @@ python main.py
 ### macOS
 
 ```bash
-bash scripts/build_macos.sh all -v 1.0.0
+bash scripts/build_macos.sh all -v 1.0
 ```
 
 會產生：
-- `dist/PriceTracker-1.0.0.app`
-- `dist/PriceTracker-1.0.0.dmg`
-- `dist/PriceTracker-1.0.0.pkg`
+- `dist/PriceTracker-1.0.app`
+- `dist/PriceTracker-1.0.dmg`
+- `dist/PriceTracker-1.0.pkg`
 
 ### Windows
 
 ```bat
-scripts\build_windows.bat exe -v 1.0.0
+scripts\build_windows.bat exe -v 1.0
 ```
+
+Windows 打包注意事項：
+
+- 打包腳本必須使用 CPython（python.org 版本），不要使用 Conda Python。
+- 若 `.build-venv` 是由 Conda 建立，請先執行 `scripts\build_windows.bat clean` 後再重打包。
+- 可透過環境變數強制指定 Python 解譯器：
+
+```bat
+set PRICE_TRACKER_CPYTHON=C:\Users\<your_user>\AppData\Local\Programs\Python\Python313\python.exe
+scripts\build_windows.bat clean
+scripts\build_windows.bat exe -v 1.0
+```
+
+常見錯誤：
+
+- `[ERROR] .build-venv was created from Conda Python ...`
+  - 原因：現有 venv 是用 Conda 建立。
+  - 解法：先 `clean`，再用 CPython 重建後打包。
+- `[ERROR] Bootstrap CPython path is empty.`
+  - 原因：找不到 CPython，或 `PRICE_TRACKER_CPYTHON` 是空值 / 無效路徑。
+  - 解法：設定正確的 `python.exe` 路徑後重新執行。
 
 ## 設定檔位置
 

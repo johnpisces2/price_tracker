@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableExtensions EnableDelayedExpansion
 
 cd /d "%~dp0"
 set "ROOT_DIR=%CD%\.."
@@ -9,6 +9,7 @@ set "DIST_DIR=%ROOT_DIR%\dist"
 set "BUILD_DIR=%ROOT_DIR%\build"
 set "SCRIPTS_BUILD_DIR=%~dp0build"
 set "SCRIPTS_DIST_DIR=%~dp0dist"
+set "BOOTSTRAP_PYTHON="
 
 set "MODE=exe"
 set "VERSION="
@@ -70,7 +71,17 @@ if not exist "%SPEC_FILE%" (
 )
 
 if not exist "%VENV_DIR%" (
-  python -m venv "%VENV_DIR%"
+  call :resolve_bootstrap_python
+  if errorlevel 1 exit /b 1
+
+  if "!BOOTSTRAP_PYTHON!"=="" (
+    echo [ERROR] Bootstrap CPython path is empty.
+    echo [HINT] Set PRICE_TRACKER_CPYTHON to a valid python.exe path.
+    exit /b 1
+  )
+
+  echo [INFO] Creating build venv with "!BOOTSTRAP_PYTHON!"
+  "!BOOTSTRAP_PYTHON!" -m venv "%VENV_DIR%"
   if errorlevel 1 (
     echo [ERROR] Failed to create venv at "%VENV_DIR%"
     exit /b 1
@@ -80,16 +91,25 @@ if not exist "%VENV_DIR%" (
 set "PYTHON=%VENV_DIR%\Scripts\python.exe"
 set "PIP=%VENV_DIR%\Scripts\pip.exe"
 
-"%PYTHON%" -m pip install --upgrade pip setuptools wheel
-if errorlevel 1 exit /b 1
-"%PIP%" install -r "%ROOT_DIR%\requirements.txt" pyinstaller
-if errorlevel 1 exit /b 1
-
 set "PY_HOME="
 for /f "usebackq tokens=1,* delims==" %%A in ("%VENV_DIR%\pyvenv.cfg") do (
   if /i "%%A"=="home " set "PY_HOME=%%B"
 )
 if defined PY_HOME if "%PY_HOME:~0,1%"==" " set "PY_HOME=%PY_HOME:~1%"
+if defined PY_HOME (
+  if /i not "%PY_HOME:conda=%"=="%PY_HOME%" (
+    echo [ERROR] .build-venv was created from Conda Python: "%PY_HOME%"
+    echo [ERROR] Please run "scripts\build_windows.bat clean" first.
+    echo [ERROR] Then rebuild with CPython from python.org.
+    echo [HINT] Or set PRICE_TRACKER_CPYTHON to a CPython python.exe path.
+    exit /b 1
+  )
+)
+
+"%PYTHON%" -m pip install --upgrade pip setuptools wheel
+if errorlevel 1 exit /b 1
+"%PIP%" install -r "%ROOT_DIR%\requirements.txt" pyinstaller
+if errorlevel 1 exit /b 1
 
 if defined PY_HOME (
   set "PATH=%VENV_DIR%\Scripts;%PY_HOME%;%PY_HOME%\DLLs;%PY_HOME%\Library\bin;%SystemRoot%\System32;%SystemRoot%"
@@ -115,8 +135,44 @@ if exist "%DIST_DIR%\settings.json" del /f /q "%DIST_DIR%\settings.json"
 for %%F in ("%DIST_DIR%\settings.*.json") do (
   if exist "%%~fF" del /f /q "%%~fF"
 )
+
 endlocal
 exit /b 0
+
+:resolve_bootstrap_python
+set "BOOTSTRAP_PYTHON="
+set "MANUAL_PY=%PRICE_TRACKER_CPYTHON%"
+if defined MANUAL_PY set "MANUAL_PY=%MANUAL_PY:"=%"
+if defined MANUAL_PY if not "%MANUAL_PY%"=="" (
+  for %%I in ("%MANUAL_PY%") do set "MANUAL_PY=%%~fI"
+  if exist "%MANUAL_PY%" (
+    set "BOOTSTRAP_PYTHON=%MANUAL_PY%"
+    exit /b 0
+  )
+  echo [ERROR] PRICE_TRACKER_CPYTHON does not exist: "%MANUAL_PY%"
+  exit /b 1
+)
+
+for %%I in (
+  "%LocalAppData%\Programs\Python\Python313\python.exe"
+  "%LocalAppData%\Programs\Python\Python312\python.exe"
+  "%LocalAppData%\Programs\Python\Python311\python.exe"
+  "%ProgramFiles%\Python313\python.exe"
+  "%ProgramFiles%\Python312\python.exe"
+  "%ProgramFiles%\Python311\python.exe"
+  "%ProgramFiles(x86)%\Python313\python.exe"
+  "%ProgramFiles(x86)%\Python312\python.exe"
+  "%ProgramFiles(x86)%\Python311\python.exe"
+) do (
+  if exist "%%~I" (
+    set "BOOTSTRAP_PYTHON=%%~fI"
+    exit /b 0
+  )
+)
+
+echo [ERROR] CPython (python.org) not found.
+echo [HINT] Install CPython 3.11+ or set PRICE_TRACKER_CPYTHON to python.exe path.
+exit /b 1
 
 :do_clean
 echo [INFO] Cleaning build artifacts...
