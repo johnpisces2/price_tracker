@@ -75,6 +75,7 @@ import yfinance as yf
 from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QCloseEvent, QColor, QPalette
 from PyQt6.QtWidgets import (
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -113,6 +114,19 @@ METRICS = [
     ("BB Upper", "bb_upper"),
     ("BB Lower", "bb_lower"),
 ]
+METRIC_NAME_TO_KEY = dict(METRICS)
+RIGHT_COMPARISON_VALUE_KEY = "value"
+RIGHT_COMPARISON_OPTIONS = [
+    ("Value", RIGHT_COMPARISON_VALUE_KEY),
+    ("RSI", "rsi"),
+    ("EMA1", "ema1"),
+    ("EMA2", "ema2"),
+    ("EMA3", "ema3"),
+    ("EMA4", "ema4"),
+    ("BB Lower", "bb_lower"),
+    ("BB Upper", "bb_upper"),
+]
+RIGHT_COMPARISON_KEYS = {key for _, key in RIGHT_COMPARISON_OPTIONS}
 OPERATORS = [">", "<", ">=", "<=", "==", "Cross Above", "Cross Below"]
 TIMEFRAMES = ["1d", "4h", "1h", "15m", "5m", "1m"]
 TIMEFRAME_TO_SECONDS = {
@@ -151,7 +165,7 @@ class AppSettings:
     telegram_token: str = ""
     telegram_chat_id: str = ""
     update_seconds: int = 30
-    cooldown_seconds: int = 300
+    cooldown_seconds: int = 600
     indicators: IndicatorSettings = field(default_factory=IndicatorSettings)
     conditions: List[dict] = field(default_factory=list)
 
@@ -171,6 +185,8 @@ class DataSnapshot:
     bb_upper: float
     bb_lower: float
     timestamp_ms: int
+    candle_metrics: dict[str, float] = field(default_factory=dict)
+    prev_candle_metrics: dict[str, float] = field(default_factory=dict)
 
 
 def load_settings() -> AppSettings:
@@ -207,7 +223,7 @@ def load_settings() -> AppSettings:
             telegram_token=str(raw.get("telegram_token", "")),
             telegram_chat_id=str(raw.get("telegram_chat_id", "")),
             update_seconds=int(raw.get("update_seconds", 30)),
-            cooldown_seconds=int(raw.get("cooldown_seconds", 300)),
+            cooldown_seconds=int(raw.get("cooldown_seconds", 600)),
             indicators=indicators,
             conditions=list(raw.get("conditions", [])),
         )
@@ -545,27 +561,63 @@ class MarketDataService:
 
         df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "volume"])
         close = df["close"]
+        volume_series = df["volume"]
 
-        ema1 = ta.trend.EMAIndicator(close, window=settings.ema1_period).ema_indicator().iloc[-1]
-        ema2 = ta.trend.EMAIndicator(close, window=settings.ema2_period).ema_indicator().iloc[-1]
-        ema3 = ta.trend.EMAIndicator(close, window=settings.ema3_period).ema_indicator().iloc[-1]
-        ema4 = ta.trend.EMAIndicator(close, window=settings.ema4_period).ema_indicator().iloc[-1]
-        rsi = ta.momentum.RSIIndicator(close, window=settings.rsi_period).rsi().iloc[-1]
-        volume = float(df["volume"].iloc[-1])
+        ema1_series = ta.trend.EMAIndicator(close, window=settings.ema1_period).ema_indicator()
+        ema2_series = ta.trend.EMAIndicator(close, window=settings.ema2_period).ema_indicator()
+        ema3_series = ta.trend.EMAIndicator(close, window=settings.ema3_period).ema_indicator()
+        ema4_series = ta.trend.EMAIndicator(close, window=settings.ema4_period).ema_indicator()
+        rsi_series = ta.momentum.RSIIndicator(close, window=settings.rsi_period).rsi()
         bb = ta.volatility.BollingerBands(
             close,
             window=settings.bb_period,
             window_dev=settings.bb_std,
         )
-        bb_upper = bb.bollinger_hband().iloc[-1]
-        bb_lower = bb.bollinger_lband().iloc[-1]
+        bb_upper_series = bb.bollinger_hband()
+        bb_lower_series = bb.bollinger_lband()
+
+        candle_metrics = {
+            "price": float(close.iloc[-1]),
+            "rsi": float(rsi_series.iloc[-1]),
+            "ema1": float(ema1_series.iloc[-1]),
+            "ema2": float(ema2_series.iloc[-1]),
+            "ema3": float(ema3_series.iloc[-1]),
+            "ema4": float(ema4_series.iloc[-1]),
+            "volume": float(volume_series.iloc[-1]),
+            "bb_upper": float(bb_upper_series.iloc[-1]),
+            "bb_lower": float(bb_lower_series.iloc[-1]),
+        }
+        prev_candle_metrics = {
+            "price": float(close.iloc[-2]),
+            "rsi": float(rsi_series.iloc[-2]),
+            "ema1": float(ema1_series.iloc[-2]),
+            "ema2": float(ema2_series.iloc[-2]),
+            "ema3": float(ema3_series.iloc[-2]),
+            "ema4": float(ema4_series.iloc[-2]),
+            "volume": float(volume_series.iloc[-2]),
+            "bb_upper": float(bb_upper_series.iloc[-2]),
+            "bb_lower": float(bb_lower_series.iloc[-2]),
+        }
 
         ticker = self.exchange.fetch_ticker(symbol)
         price = float(ticker.get("last") or close.iloc[-1])
         prev_close = float(close.iloc[-2])
         timestamp_ms = int(ticker.get("timestamp") or int(df["ts"].iloc[-1]))
+        rsi = candle_metrics["rsi"]
+        ema1 = candle_metrics["ema1"]
+        ema2 = candle_metrics["ema2"]
+        ema3 = candle_metrics["ema3"]
+        ema4 = candle_metrics["ema4"]
+        volume = candle_metrics["volume"]
+        bb_upper = candle_metrics["bb_upper"]
+        bb_lower = candle_metrics["bb_lower"]
 
-        values = [price, prev_close, rsi, ema1, ema2, ema3, ema4, volume, bb_upper, bb_lower]
+        values = [
+            price,
+            prev_close,
+            *candle_metrics.values(),
+            *prev_candle_metrics.values(),
+        ]
         if any(math.isnan(float(v)) for v in values):
             raise RuntimeError("Indicator calculation returned NaN")
 
@@ -583,6 +635,8 @@ class MarketDataService:
             bb_upper=float(bb_upper),
             bb_lower=float(bb_lower),
             timestamp_ms=timestamp_ms,
+            candle_metrics=candle_metrics,
+            prev_candle_metrics=prev_candle_metrics,
         )
 
     def _fetch_yf_snapshot(self, symbol: str, settings: IndicatorSettings) -> DataSnapshot:
@@ -611,19 +665,41 @@ class MarketDataService:
             raise RuntimeError("Not enough candle data")
 
         close = df["close"]
-        ema1 = ta.trend.EMAIndicator(close, window=settings.ema1_period).ema_indicator().iloc[-1]
-        ema2 = ta.trend.EMAIndicator(close, window=settings.ema2_period).ema_indicator().iloc[-1]
-        ema3 = ta.trend.EMAIndicator(close, window=settings.ema3_period).ema_indicator().iloc[-1]
-        ema4 = ta.trend.EMAIndicator(close, window=settings.ema4_period).ema_indicator().iloc[-1]
-        rsi = ta.momentum.RSIIndicator(close, window=settings.rsi_period).rsi().iloc[-1]
-        volume = float(df["volume"].iloc[-1])
+        volume_series = df["volume"]
+        ema1_series = ta.trend.EMAIndicator(close, window=settings.ema1_period).ema_indicator()
+        ema2_series = ta.trend.EMAIndicator(close, window=settings.ema2_period).ema_indicator()
+        ema3_series = ta.trend.EMAIndicator(close, window=settings.ema3_period).ema_indicator()
+        ema4_series = ta.trend.EMAIndicator(close, window=settings.ema4_period).ema_indicator()
+        rsi_series = ta.momentum.RSIIndicator(close, window=settings.rsi_period).rsi()
         bb = ta.volatility.BollingerBands(
             close,
             window=settings.bb_period,
             window_dev=settings.bb_std,
         )
-        bb_upper = bb.bollinger_hband().iloc[-1]
-        bb_lower = bb.bollinger_lband().iloc[-1]
+        bb_upper_series = bb.bollinger_hband()
+        bb_lower_series = bb.bollinger_lband()
+        candle_metrics = {
+            "price": float(close.iloc[-1]),
+            "rsi": float(rsi_series.iloc[-1]),
+            "ema1": float(ema1_series.iloc[-1]),
+            "ema2": float(ema2_series.iloc[-1]),
+            "ema3": float(ema3_series.iloc[-1]),
+            "ema4": float(ema4_series.iloc[-1]),
+            "volume": float(volume_series.iloc[-1]),
+            "bb_upper": float(bb_upper_series.iloc[-1]),
+            "bb_lower": float(bb_lower_series.iloc[-1]),
+        }
+        prev_candle_metrics = {
+            "price": float(close.iloc[-2]),
+            "rsi": float(rsi_series.iloc[-2]),
+            "ema1": float(ema1_series.iloc[-2]),
+            "ema2": float(ema2_series.iloc[-2]),
+            "ema3": float(ema3_series.iloc[-2]),
+            "ema4": float(ema4_series.iloc[-2]),
+            "volume": float(volume_series.iloc[-2]),
+            "bb_upper": float(bb_upper_series.iloc[-2]),
+            "bb_lower": float(bb_lower_series.iloc[-2]),
+        }
 
         price = float(close.iloc[-1])
         try:
@@ -640,8 +716,21 @@ class MarketDataService:
             last_ts = last_ts.tz_localize("UTC")
         timestamp_ms = int(last_ts.timestamp() * 1000)
         quote_currency = "TWD" if symbol in TW_ETF_SYMBOLS else "USD"
+        rsi = candle_metrics["rsi"]
+        ema1 = candle_metrics["ema1"]
+        ema2 = candle_metrics["ema2"]
+        ema3 = candle_metrics["ema3"]
+        ema4 = candle_metrics["ema4"]
+        volume = candle_metrics["volume"]
+        bb_upper = candle_metrics["bb_upper"]
+        bb_lower = candle_metrics["bb_lower"]
 
-        values = [price, prev_close, rsi, ema1, ema2, ema3, ema4, volume, bb_upper, bb_lower]
+        values = [
+            price,
+            prev_close,
+            *candle_metrics.values(),
+            *prev_candle_metrics.values(),
+        ]
         if any(math.isnan(float(v)) for v in values):
             raise RuntimeError("Indicator calculation returned NaN")
 
@@ -659,6 +748,8 @@ class MarketDataService:
             bb_upper=float(bb_upper),
             bb_lower=float(bb_lower),
             timestamp_ms=timestamp_ms,
+            candle_metrics=candle_metrics,
+            prev_candle_metrics=prev_candle_metrics,
         )
 
     def _get_yf_ticker(self, symbol: str) -> yf.Ticker:
@@ -809,12 +900,15 @@ class ConditionRow(QWidget):
 
     def __init__(self, data: Optional[dict] = None):
         super().__init__()
+        self.latest_snapshot: Optional[DataSnapshot] = None
         self.enabled = QCheckBox("Enable")
         self.left_metric = QComboBox()
         self.left_metric.addItems([name for name, _ in METRICS])
         self.operator = QComboBox()
         self.operator.addItems(OPERATORS)
-        self.value_label = QLabel("Value")
+        self.right_mode = QComboBox()
+        for mode_name, mode_key in RIGHT_COMPARISON_OPTIONS:
+            self.right_mode.addItem(mode_name, mode_key)
         self.right_value = QDoubleSpinBox()
         self.right_value.setRange(-1_000_000_000, 1_000_000_000)
         self.right_value.setDecimals(1)
@@ -828,17 +922,19 @@ class ConditionRow(QWidget):
         layout.setSpacing(8)
         self.left_metric.setFixedWidth(140)
         self.operator.setFixedWidth(115)
-        self.value_label.setFixedWidth(48)
+        self.right_mode.setFixedWidth(120)
         self.right_value.setFixedWidth(150)
         self.remove_btn.setFixedWidth(100)
         layout.addWidget(self.enabled)
         layout.addWidget(self.left_metric)
         layout.addWidget(self.operator)
-        layout.addWidget(self.value_label)
+        layout.addWidget(self.right_mode)
         layout.addWidget(self.right_value)
         layout.addWidget(self.remove_btn)
         layout.addStretch(1)
         self.setLayout(layout)
+        self.right_mode.currentIndexChanged.connect(self._on_right_mode_changed)
+        self._on_right_mode_changed()
 
         if data:
             self.from_dict(data)
@@ -848,7 +944,7 @@ class ConditionRow(QWidget):
             "enabled": self.enabled.isChecked(),
             "left_metric": self.left_metric.currentText(),
             "operator": self.operator.currentText(),
-            "right_mode": "Value",
+            "right_mode": self._current_right_mode(),
             "right_value": self.right_value.value(),
         }
 
@@ -856,24 +952,113 @@ class ConditionRow(QWidget):
         self.enabled.setChecked(bool(data.get("enabled", False)))
         self.left_metric.setCurrentText(str(data.get("left_metric", "Price")))
         self.operator.setCurrentText(str(data.get("operator", ">")))
+        self._set_right_mode(self._normalize_right_mode(data.get("right_mode", RIGHT_COMPARISON_VALUE_KEY)))
         self.right_value.setValue(float(data.get("right_value", 0.0)))
+        self._on_right_mode_changed()
 
     def description(self) -> str:
-        return f"{self.left_metric.currentText()} {self.operator.currentText()} {self.right_value.value():.1f}"
+        if self._current_right_mode() == RIGHT_COMPARISON_VALUE_KEY:
+            right_text = f"{self.right_value.value():.1f}"
+        else:
+            right_text = self.right_mode.currentText()
+        return f"{self.left_metric.currentText()} {self.operator.currentText()} {right_text}"
 
     def is_enabled(self) -> bool:
         return self.enabled.isChecked()
 
     @staticmethod
-    def _metric_value(snapshot: DataSnapshot, metric_name: str) -> float:
-        key = dict(METRICS).get(metric_name)
+    def _metric_key(metric_name: str) -> str:
+        key = METRIC_NAME_TO_KEY.get(metric_name)
         if not key:
             raise ValueError(f"Unknown metric: {metric_name}")
-        return float(getattr(snapshot, key))
+        return key
+
+    @staticmethod
+    def _metric_value_by_key(snapshot: DataSnapshot, metric_key: str) -> float:
+        if not hasattr(snapshot, metric_key):
+            raise ValueError(f"Unknown metric key: {metric_key}")
+        return float(getattr(snapshot, metric_key))
+
+    @staticmethod
+    def _normalize_right_mode(raw: object) -> str:
+        text = str(raw or "").strip()
+        if not text:
+            return RIGHT_COMPARISON_VALUE_KEY
+        if text.lower() == RIGHT_COMPARISON_VALUE_KEY or text.lower() == "value":
+            return RIGHT_COMPARISON_VALUE_KEY
+        if text in RIGHT_COMPARISON_KEYS:
+            return text
+        metric_key = METRIC_NAME_TO_KEY.get(text)
+        if metric_key in RIGHT_COMPARISON_KEYS:
+            return metric_key
+        return RIGHT_COMPARISON_VALUE_KEY
+
+    def _set_right_mode(self, mode_key: str) -> None:
+        for idx in range(self.right_mode.count()):
+            if self.right_mode.itemData(idx) == mode_key:
+                self.right_mode.setCurrentIndex(idx)
+                return
+        self.right_mode.setCurrentIndex(0)
+
+    def _current_right_mode(self) -> str:
+        mode_key = self.right_mode.currentData()
+        if isinstance(mode_key, str):
+            return mode_key
+        return RIGHT_COMPARISON_VALUE_KEY
+
+    def _on_right_mode_changed(self) -> None:
+        self._refresh_right_display()
+
+    def set_snapshot(self, snapshot: Optional[DataSnapshot]) -> None:
+        self.latest_snapshot = snapshot
+        self._refresh_right_display()
+
+    def _refresh_right_display(self) -> None:
+        use_fixed_value = self._current_right_mode() == RIGHT_COMPARISON_VALUE_KEY
+        self.right_value.setReadOnly(not use_fixed_value)
+        self.right_value.setButtonSymbols(
+            QAbstractSpinBox.ButtonSymbols.UpDownArrows
+            if use_fixed_value
+            else QAbstractSpinBox.ButtonSymbols.NoButtons
+        )
+        if use_fixed_value:
+            return
+        if self.latest_snapshot is None:
+            prev_block = self.right_value.blockSignals(True)
+            self.right_value.setValue(0.0)
+            self.right_value.blockSignals(prev_block)
+            return
+        try:
+            value = self._metric_value_by_key(self.latest_snapshot, self._current_right_mode())
+        except Exception:
+            return
+        prev_block = self.right_value.blockSignals(True)
+        self.right_value.setValue(value)
+        self.right_value.blockSignals(prev_block)
+
+    @classmethod
+    def _cross_pair(
+        cls,
+        current: DataSnapshot,
+        previous: Optional[DataSnapshot],
+        metric_key: str,
+        current_value: float,
+    ) -> Optional[Tuple[float, float]]:
+        if metric_key in current.prev_candle_metrics and metric_key in current.candle_metrics:
+            return float(current.prev_candle_metrics[metric_key]), float(current.candle_metrics[metric_key])
+        if previous is None:
+            return None
+        return cls._metric_value_by_key(previous, metric_key), current_value
 
     def evaluate(self, current: DataSnapshot, previous: Optional[DataSnapshot]) -> bool:
-        left = self._metric_value(current, self.left_metric.currentText())
-        right = self.right_value.value()
+        metric_name = self.left_metric.currentText()
+        left_key = self._metric_key(metric_name)
+        left = self._metric_value_by_key(current, left_key)
+        right_mode = self._current_right_mode()
+        if right_mode == RIGHT_COMPARISON_VALUE_KEY:
+            right = self.right_value.value()
+        else:
+            right = self._metric_value_by_key(current, right_mode)
         op = self.operator.currentText()
 
         if op == ">":
@@ -886,15 +1071,23 @@ class ConditionRow(QWidget):
             return left <= right
         if op == "==":
             return abs(left - right) < 1e-10
-        if previous is None:
+        left_pair = self._cross_pair(current, previous, left_key, left)
+        if left_pair is None:
             return False
+        prev_left, candle_left = left_pair
 
-        prev_left = self._metric_value(previous, self.left_metric.currentText())
-        prev_right = self.right_value.value()
+        if right_mode == RIGHT_COMPARISON_VALUE_KEY:
+            prev_right, candle_right = right, right
+        else:
+            right_pair = self._cross_pair(current, previous, right_mode, right)
+            if right_pair is None:
+                return False
+            prev_right, candle_right = right_pair
+
         if op == "Cross Above":
-            return prev_left <= prev_right and left > right
+            return prev_left <= prev_right and candle_left > candle_right
         if op == "Cross Below":
-            return prev_left >= prev_right and left < right
+            return prev_left >= prev_right and candle_left < candle_right
         return False
 
 
@@ -1062,7 +1255,7 @@ class MainWindow(QMainWindow):
         self.update_sec_input.setValue(30)
         self.cooldown_input = QSpinBox()
         self.cooldown_input.setRange(0, 86400)
-        self.cooldown_input.setValue(300)
+        self.cooldown_input.setValue(600)
         self.timeframe_input = QComboBox()
         self.timeframe_input.addItems(TIMEFRAMES)
         self.timeframe_input.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
@@ -1283,6 +1476,7 @@ class MainWindow(QMainWindow):
 
     def add_condition(self, data: Optional[dict] = None) -> None:
         row = ConditionRow(data)
+        row.set_snapshot(self.current_snapshot)
         row.remove_requested.connect(self.remove_condition)
         self.condition_rows.append(row)
         self.conditions_container.addWidget(row)
@@ -1347,6 +1541,8 @@ class MainWindow(QMainWindow):
     def on_fetch_success(self, snapshot: DataSnapshot) -> None:
         self.previous_snapshot = self.current_snapshot
         self.current_snapshot = snapshot
+        for row in self.condition_rows:
+            row.set_snapshot(snapshot)
         self.price_title_label.setText(f"{snapshot.symbol} Price")
         self.price_label.setText(f"{snapshot.price:,.1f} {snapshot.quote_currency}")
         trend = 1 if snapshot.price > snapshot.prev_close else (-1 if snapshot.price < snapshot.prev_close else 0)
@@ -1368,6 +1564,8 @@ class MainWindow(QMainWindow):
     def on_fetch_failed(self, err: str) -> None:
         if "No data source (market closed)" in err:
             self.current_snapshot = None
+            for row in self.condition_rows:
+                row.set_snapshot(None)
             self._show_no_data_state(self.symbol_input.currentText())
         self.log(f"Fetch failed: {err}")
 
