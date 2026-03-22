@@ -1,63 +1,214 @@
 # PriceTracker
 
-`PyQt6` 桌面價格追蹤器，可監控價格與技術指標，並透過 Telegram 發送提醒。
+PriceTracker is a PyQt6 desktop app for monitoring crypto and ETF prices, calculating technical indicators, and sending Telegram alerts when your conditions are met.
 
 ## Screenshot
 
 ![PriceTracker Screenshot](screenshot.png)
 
-## 主要功能
+## Features
 
-- 交易標的：`BTC/USDT`、`ETH/USDT`、`0050.TW`、`0056.TW`、`SPY`、`QQQ`、`DIA`、`VOO`、`IVV`
-- 指標：`EMA1~EMA4`、`RSI`、`Volume`、`Bollinger Bands (BB)`
-- 條件式提醒：可堆多條件（AND 邏輯）
-- Telegram 通知：支援自動偵測 `chat_id`（使用者不用手動輸入）
-- 自動更新：依 `Update(sec)` 週期背景更新
-- 無資料源時（例如休市）：Dashboard 以 `-` 顯示
+- Track supported symbols:
+  - Crypto: `BTC/USDT`, `ETH/USDT`
+  - Taiwan ETFs: `0050.TW`, `0056.TW`
+  - US ETFs: `SPY`, `QQQ`, `DIA`, `VOO`, `IVV`
+- Built-in indicators:
+  - `Price`
+  - `RSI`
+  - `EMA1` to `EMA4`
+  - `Volume`
+  - `Bollinger Bands (BB Upper / BB Lower)`
+- Configurable timeframe:
+  - `1m`, `5m`, `15m`, `1h`, `4h`, `1d`
+- Condition builder with `AND` logic
+- Operators:
+  - `>`
+  - `<`
+  - `>=`
+  - `<=`
+  - `==`
+  - `Cross Above`
+  - `Cross Below`
+- Right-hand side comparison can use:
+  - a fixed numeric value
+  - another indicator value
+- Background data refresh with manual refresh support
+- Telegram bot integration with background long-poll listener
+- Telegram commands:
+  - `/start`
+  - `/status`
+  - `/condition`
+- Quiet heartbeat logging:
+  - successful refreshes stay silent
+  - market-closed state stays silent
+  - network errors are logged
 
-## 安裝與啟動
+## Alert Behavior
+
+- `Update (sec)` controls how often market data is refreshed.
+- Indicators are recalculated on every refresh.
+- Alerts are sent only when all enabled conditions become true.
+- A condition must transition from `false` to `true` before a new alert is sent.
+- `Cooldown (sec)` limits how soon another alert can be sent after the previous alert.
+- If a condition stays true continuously, the app does not keep spamming alerts every refresh.
+
+## Telegram Bot Behavior
+
+The app runs a background Telegram long-poll listener after a valid bot token is configured.
+
+- Send `/start` to open the chat with the bot and let the app detect your private `chat_id`
+- Send `/status` to receive:
+  - symbol
+  - timeframe
+  - current price
+  - RSI
+  - EMA1 to EMA4
+  - volume
+  - Bollinger Bands
+  - last update time
+- Send `/condition` to receive:
+  - current symbol
+  - timeframe
+  - configured condition count
+  - enabled condition count
+  - cooldown
+  - all enabled monitoring conditions
+
+## Installation
 
 ```bash
 pip install -r requirements.txt
 python main.py
 ```
 
-可選參數：
-- `--profile <name>`：使用 `settings.<name>.json`
-- `--config <path>`：指定完整設定檔路徑
+## Requirements
 
-環境變數：
-- `PRICE_TRACKER_CONFIG=<path>`
+- Python 3.13 is recommended in this repo's current setup
+- See [requirements.txt](requirements.txt) for Python packages
 
-## Telegram 設定教學
+Main dependencies:
 
-1. 到 Telegram `@BotFather` 建立 bot，取得 `token`
-2. 在 PriceTracker 的 `Telegram Token` 輸入 token，按 `Save Settings`
-3. 到你的 bot 對話視窗（例如 `@xxxx_bot`）送出 `/start`
-4. 回到 PriceTracker，按 `Save Settings` 或 `Test`
-5. 若成功，Dashboard 的 `Telegram` 會顯示 `Connected`（綠色）
+- `PyQt6`
+- `ccxt`
+- `numpy`
+- `pandas`
+- `requests`
+- `ta`
+- `yfinance`
 
-注意：
-- 本程式不需要手動輸入 `chat_id`
-- `chat_id` 會在背景同步更新時自動抓取並保存
-- 若顯示 `Waiting for chat_id`，通常是尚未對 bot 發送 `/start`
+## How To Use
 
-## PriceTracker 使用流程
+1. Launch the app.
+2. Select a `Symbol`.
+3. Choose a `Timeframe`.
+4. Adjust indicator parameters if needed:
+   - `EMA1`
+   - `EMA2`
+   - `EMA3`
+   - `EMA4`
+   - `RSI`
+   - `BB Period`
+   - `BB Std Dev`
+5. Set `Update (sec)`.
+6. Set `Cooldown (sec)`.
+7. Enter your Telegram bot token.
+8. Click `Save Settings`.
+9. Click `Add Condition` and enable the conditions you want to monitor.
+10. Optional: click `Manual Refresh` to fetch data immediately.
 
-1. 在 `Settings` 選擇 `Symbol` 與 `Timeframe`
-2. 設定 `Update(sec)` 與 `Cooldown(sec)`
-3. 調整指標參數（EMA1~EMA4、RSI、BB）
-4. 按 `Save Settings`
-5. 按 `Add Condition` 增加條件，勾選 `Enable`
-6. 條件成立時會依 cooldown 發送 Telegram 訊息
-7. 可按 `Manual Refresh` 手動刷新（不影響背景自動更新）
+## Telegram Setup
 
-條件欄位說明：
-- 左側：指標（Price/RSI/EMA/Volume/BB）
-- 中間：運算子（`>`, `<`, `>=`, `<=`, `==`, `Cross Above`, `Cross Below`）
-- 右側：比較數值 `Value`
+1. Create a bot with `@BotFather`.
+2. Copy the bot token.
+3. Paste the token into the app's `Telegram Token` field.
+4. Click `Save Settings`.
+5. Open a private chat with your bot.
+6. Send `/start`.
+7. Wait for the app to detect and save your `chat_id`.
+8. You can then:
+   - click `Test`
+   - use `/status`
+   - use `/condition`
+   - receive automatic alerts
 
-## 打包（含版本號）
+Notes:
+
+- If the dashboard shows `Waiting for chat_id`, send `/start` to the bot first.
+- The app prefers a private chat `chat_id` when auto-detecting Telegram updates.
+- Telegram listener status is shown in the dashboard.
+
+## Condition Builder
+
+Each condition row includes:
+
+- `Enable`
+- left metric
+- operator
+- right comparison mode
+- right value / indicator value
+
+Examples:
+
+- `Price > 70000`
+- `RSI < 30`
+- `EMA1 Cross Above EMA2`
+- `Price Cross Below BB Lower`
+
+## Data Sources
+
+- Crypto data: `ccxt` with Binance
+- ETF / stock data: `yfinance`
+
+Notes:
+
+- `4h` Yahoo Finance data is resampled from `60m` candles
+- If market data is unavailable, the dashboard shows `-`
+- For Yahoo Finance symbols, the app treats stale data as market closed
+
+## Configuration Files
+
+By default:
+
+- source run: `./settings.json`
+- `--profile dev`: `./settings.dev.json`
+
+Runtime options:
+
+```bash
+python main.py --profile myprofile
+python main.py --config /path/to/custom-settings.json
+```
+
+Environment variable:
+
+```bash
+PRICE_TRACKER_CONFIG=/path/to/custom-settings.json
+```
+
+Packaged app config fallback:
+
+- macOS: `~/Library/Application Support/PriceTracker/settings.json`
+- Windows: `%APPDATA%\PriceTracker\settings.json`
+
+## Multiple Instances
+
+You can run multiple app instances with separate config files.
+
+Using profiles:
+
+```bash
+python main.py --profile a
+python main.py --profile b
+```
+
+Using explicit config paths:
+
+```bash
+python main.py --config /path/to/trader1.json
+python main.py --config /path/to/trader2.json
+```
+
+## Build
 
 ### macOS
 
@@ -65,7 +216,8 @@ python main.py
 bash scripts/build_macos.sh all -v 1.0
 ```
 
-會產生：
+Expected outputs:
+
 - `dist/PriceTracker-1.0.app`
 - `dist/PriceTracker-1.0.dmg`
 - `dist/PriceTracker-1.0.pkg`
@@ -76,11 +228,17 @@ bash scripts/build_macos.sh all -v 1.0
 scripts\build_windows.bat exe -v 1.0
 ```
 
-Windows 打包注意事項：
+Files in [scripts](scripts):
 
-- 打包腳本必須使用 CPython（python.org 版本），不要使用 Conda Python。
-- 若 `.build-venv` 是由 Conda 建立，請先執行 `scripts\build_windows.bat clean` 後再重打包。
-- 可透過環境變數強制指定 Python 解譯器：
+- `scripts/build_macos.sh`
+- `scripts/build_windows.bat`
+- `scripts/PriceTracker.win.spec`
+
+## Windows Build Notes
+
+- Use a regular CPython install for packaging.
+- Avoid building with a Conda Python bootstrap environment.
+- If needed, point the script to CPython explicitly:
 
 ```bat
 set PRICE_TRACKER_CPYTHON=C:\Users\<your_user>\AppData\Local\Programs\Python\Python313\python.exe
@@ -88,66 +246,19 @@ scripts\build_windows.bat clean
 scripts\build_windows.bat exe -v 1.0
 ```
 
-常見錯誤：
+Common packaging issues:
 
-- `[ERROR] .build-venv was created from Conda Python ...`
-  - 原因：現有 venv 是用 Conda 建立。
-  - 解法：先 `clean`，再用 CPython 重建後打包。
-- `[ERROR] Bootstrap CPython path is empty.`
-  - 原因：找不到 CPython，或 `PRICE_TRACKER_CPYTHON` 是空值 / 無效路徑。
-  - 解法：設定正確的 `python.exe` 路徑後重新執行。
+- `.build-venv was created from Conda Python`
+  - clean the build venv and rebuild with CPython
+- `Bootstrap CPython path is empty`
+  - set `PRICE_TRACKER_CPYTHON` to a valid `python.exe`
 
-## 設定檔位置
+## Recent Behavior Changes
 
-### Source 直接執行
+The current app version includes:
 
-- 預設：當前目錄 `./settings.json`
-- `--profile dev`：`./settings.dev.json`
-
-### 打包版（macOS / Windows）
-
-- 先嘗試「程式所在資料夾」
-- 若該目錄不可寫，才 fallback
-- macOS：`~/Library/Application Support/PriceTracker/settings.json`
-- Windows：`%APPDATA%\PriceTracker\settings.json`
-
-注意：`settings.json` 不會預先打包進 app，使用者第一次儲存時才建立。
-
-## 同時開多個實例（不同 settings.json）
-
-### 方法 1：`--profile`（推薦）
-
-macOS：
-
-```bash
-open -n "/path/to/PriceTracker.app" --args --profile a
-open -n "/path/to/PriceTracker.app" --args --profile b
-```
-
-Windows：
-
-```bat
-start "" "C:\path\PriceTracker.exe" --profile a
-start "" "C:\path\PriceTracker.exe" --profile b
-```
-
-### 方法 2：`--config` 指定完整路徑
-
-macOS：
-
-```bash
-open -n "/path/to/PriceTracker.app" --args --config "/path/to/cfg/trader1.json"
-open -n "/path/to/PriceTracker.app" --args --config "/path/to/cfg/trader2.json"
-```
-
-Windows：
-
-```bat
-start "" "C:\path\PriceTracker.exe" --config "C:\cfg\trader1.json"
-start "" "C:\path\PriceTracker.exe" --config "D:\cfg\trader2.json"
-```
-
-## 備註
-
-- 直接雙擊同一個 app / exe（不帶參數）會共用同一份預設設定檔
-- Telegram 連線與發送採背景執行，不應卡住 UI
+- Telegram background long-poll instead of one-shot sync
+- `/status` Telegram command
+- `/condition` Telegram command
+- quieter log output during normal heartbeat updates
+- fixed-height condition panel to avoid layout jumping when adding rows

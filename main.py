@@ -335,6 +335,17 @@ class TelegramService:
     def _api_url(self, method: str) -> str:
         return f"https://api.telegram.org/bot{self.token}/{method}"
 
+    def get_me(self) -> Tuple[Optional[dict], str]:
+        if not self.token:
+            return None, "Missing token"
+        r, payload, err = self._request_api("GET", "getMe")
+        if err:
+            return None, err
+        if r and r.ok and payload.get("ok", False):
+            result = payload.get("result", {})
+            return result if isinstance(result, dict) else {}, ""
+        return None, str(payload.get("description", "Token invalid"))
+
     def _request_api(
         self,
         http_method: str,
@@ -395,6 +406,120 @@ class TelegramService:
                 if isinstance(chat, dict) and "id" in chat:
                     return int(chat["id"])
         return None
+
+    @staticmethod
+    def _extract_message(update: dict) -> Optional[dict]:
+        for key in (
+            "message",
+            "edited_message",
+            "channel_post",
+            "edited_channel_post",
+            "business_message",
+            "edited_business_message",
+        ):
+            msg = update.get(key)
+            if isinstance(msg, dict):
+                return msg
+
+        callback = update.get("callback_query")
+        if isinstance(callback, dict):
+            msg = callback.get("message", {})
+            if isinstance(msg, dict):
+                return msg
+        return None
+
+    @classmethod
+    def extract_command(cls, update: dict) -> Optional[dict]:
+        message = cls._extract_message(update)
+        if not isinstance(message, dict):
+            return None
+
+        text = str(message.get("text", "") or "").strip()
+        if not text.startswith("/"):
+            return None
+
+        command_token = text.split(maxsplit=1)[0].strip()
+        command = command_token.split("@", 1)[0].lower()
+        if not command:
+            return None
+
+        chat = message.get("chat", {})
+        chat_id = chat.get("id") if isinstance(chat, dict) else None
+        if chat_id is None:
+            return None
+
+        user = message.get("from", {})
+        first_name = str(user.get("first_name", "") or "").strip() if isinstance(user, dict) else ""
+        return {
+            "command": command,
+            "chat_id": str(chat_id),
+            "text": text,
+            "update_id": int(update.get("update_id", 0) or 0),
+            "is_private": isinstance(chat, dict) and str(chat.get("type", "")).lower() == "private",
+            "first_name": first_name,
+        }
+
+    def get_updates(
+        self,
+        last_update_id: int = 0,
+        *,
+        timeout_sec: int = 0,
+    ) -> Tuple[List[dict], int, str, str]:
+        if not self.token:
+            return [], last_update_id, "", "Missing token"
+
+        params = {"timeout": max(0, int(timeout_sec)), "limit": 100}
+        if last_update_id > 0:
+            params["offset"] = last_update_id + 1
+
+        note = ""
+        r, payload, err = self._request_api(
+            "GET",
+            "getUpdates",
+            params=params,
+            timeout_sec=max(self.REQUEST_TIMEOUT_SEC, int(timeout_sec) + 5),
+        )
+        if err:
+            return [], last_update_id, note, err
+        if not (r and r.ok and payload.get("ok", False)):
+            desc = str(payload.get("description", "Failed to fetch updates"))
+            lower_desc = desc.lower()
+            if "webhook" in lower_desc and "getupdates" in lower_desc:
+                _, delete_payload, delete_err = self._request_api(
+                    "POST",
+                    "deleteWebhook",
+                    data={"drop_pending_updates": "false"},
+                )
+                if delete_err:
+                    return [], last_update_id, note, f"{desc}; deleteWebhook failed: {delete_err}"
+                if not bool(delete_payload.get("ok", False)):
+                    delete_desc = str(delete_payload.get("description", "deleteWebhook failed"))
+                    return [], last_update_id, note, f"{desc}; {delete_desc}"
+                note = "Webhook was active and has been cleared"
+                r, payload, err = self._request_api(
+                    "GET",
+                    "getUpdates",
+                    params=params,
+                    timeout_sec=max(self.REQUEST_TIMEOUT_SEC, int(timeout_sec) + 5),
+                )
+                if err:
+                    return [], last_update_id, note, f"Webhook cleared but getUpdates failed: {err}"
+                if not (r and r.ok and payload.get("ok", False)):
+                    retry_desc = str(payload.get("description", "Failed to fetch updates"))
+                    return [], last_update_id, note, f"Webhook cleared but getUpdates failed: {retry_desc}"
+            else:
+                return [], last_update_id, note, desc
+
+        updates = payload.get("result", [])
+        newest_id = last_update_id
+        parsed_updates: List[dict] = []
+        if isinstance(updates, list):
+            for update in updates:
+                if not isinstance(update, dict):
+                    continue
+                newest_id = max(newest_id, int(update.get("update_id", newest_id) or newest_id))
+                parsed_updates.append(update)
+        return parsed_updates, newest_id, note, ""
 
     def resolve_chat_id(self, last_update_id: int = 0) -> Tuple[str, int, str]:
         if not self.token:
@@ -496,20 +621,22 @@ class TelegramService:
         return "", newest_id, f"Waiting for chat_id (open {bot_hint} in private chat and send /start){webhook_note}"
 
     def validate(self) -> Tuple[bool, str]:
+        return self.validate_chat(self.chat_id)
+
+    def validate_chat(self, chat_id: str) -> Tuple[bool, str]:
         if not self.token:
             return False, "Missing token"
-        if not self.chat_id:
+        target_chat_id = str(chat_id or "").strip()
+        if not target_chat_id:
             return False, "Waiting for chat_id (send /start to bot)"
-        r, payload, err = self._request_api("GET", "getMe")
+        _, err = self.get_me()
         if err:
             return False, err
-        if not (r and r.ok and payload.get("ok", False)):
-            return False, str(payload.get("description", "Token invalid"))
 
         action, action_payload, err = self._request_api(
             "POST",
             "sendChatAction",
-            data={"chat_id": self.chat_id, "action": "typing"},
+            data={"chat_id": target_chat_id, "action": "typing"},
         )
         if err:
             return False, err
@@ -517,19 +644,23 @@ class TelegramService:
             return False, str(action_payload.get("description", "Chat ID invalid or bot not started"))
         return True, "Connected"
 
-    def send_message(self, text: str) -> Tuple[bool, str]:
-        if not self.token or not self.chat_id:
+    def send_message_to(self, chat_id: str, text: str) -> Tuple[bool, str]:
+        target_chat_id = str(chat_id or "").strip()
+        if not self.token or not target_chat_id:
             return False, "Missing token or chat ID"
         r, payload, err = self._request_api(
             "POST",
             "sendMessage",
-            data={"chat_id": self.chat_id, "text": text},
+            data={"chat_id": target_chat_id, "text": text},
         )
         if err:
             return False, err
         if r and r.ok and payload.get("ok", False):
             return True, "Message sent"
         return False, str(payload.get("description", "Telegram API error"))
+
+    def send_message(self, text: str) -> Tuple[bool, str]:
+        return self.send_message_to(self.chat_id, text)
 
 
 class MarketDataService:
@@ -843,33 +974,108 @@ class FetchWorker(QThread):
             self.failed.emit(str(exc))
 
 
-class TelegramSyncWorker(QThread):
-    success = pyqtSignal(object)
+class TelegramPollWorker(QThread):
+    status = pyqtSignal(object)
+    command_received = pyqtSignal(object)
     failed = pyqtSignal(str)
+
+    LONG_POLL_TIMEOUT_SEC = 10
 
     def __init__(self, token: str, chat_id: str, last_update_id: int):
         super().__init__()
         self.token = token.strip()
         self.chat_id = chat_id.strip()
         self.last_update_id = last_update_id
+        self._running = True
+
+    def stop(self) -> None:
+        self._running = False
 
     def run(self) -> None:
         try:
             service = TelegramService()
             service.set_credentials(self.token, self.chat_id)
-            resolved_chat_id, new_last_update_id, note = service.resolve_chat_id(self.last_update_id)
-            if resolved_chat_id:
-                service.set_credentials(self.token, resolved_chat_id)
-            ok, msg = service.validate()
-            self.success.emit(
+            me, err = service.get_me()
+            if err:
+                self.status.emit(
+                    {
+                        "ok": False,
+                        "status": err,
+                        "chat_id": self.chat_id,
+                        "last_update_id": self.last_update_id,
+                        "note": "",
+                    }
+                )
+                return
+
+            current_chat_id = self.chat_id
+            if current_chat_id:
+                ok, status_text = service.validate_chat(current_chat_id)
+            else:
+                ok = True
+                status_text = "Listening for Telegram commands (send /start)"
+            self.status.emit(
                 {
                     "ok": ok,
-                    "status": msg,
-                    "chat_id": resolved_chat_id or self.chat_id,
-                    "last_update_id": new_last_update_id,
-                    "note": note,
+                    "status": status_text,
+                    "chat_id": current_chat_id,
+                    "last_update_id": self.last_update_id,
+                    "note": "",
+                    "bot_username": str((me or {}).get("username", "") or ""),
                 }
             )
+
+            while self._running:
+                service.set_credentials(self.token, current_chat_id)
+                updates, new_last_update_id, note, poll_err = service.get_updates(
+                    self.last_update_id,
+                    timeout_sec=self.LONG_POLL_TIMEOUT_SEC,
+                )
+                self.last_update_id = new_last_update_id
+                if not self._running:
+                    break
+                if poll_err:
+                    self.status.emit(
+                        {
+                            "ok": False,
+                            "status": poll_err,
+                            "chat_id": current_chat_id,
+                            "last_update_id": self.last_update_id,
+                            "note": note,
+                        }
+                    )
+                    time.sleep(2)
+                    continue
+
+                if note:
+                    self.status.emit(
+                        {
+                            "ok": True,
+                            "status": "Connected" if current_chat_id else "Listening for Telegram commands (send /start)",
+                            "chat_id": current_chat_id,
+                            "last_update_id": self.last_update_id,
+                            "note": note,
+                        }
+                    )
+
+                for update in updates:
+                    detected_chat_id = TelegramService._extract_chat_id(update)
+                    if detected_chat_id is not None and not current_chat_id and detected_chat_id > 0:
+                        current_chat_id = str(detected_chat_id)
+                        self.status.emit(
+                            {
+                                "ok": True,
+                                "status": "Connected",
+                                "chat_id": current_chat_id,
+                                "last_update_id": self.last_update_id,
+                                "note": f"Auto detected chat_id: {current_chat_id}",
+                            }
+                        )
+
+                    command_payload = TelegramService.extract_command(update)
+                    if command_payload is not None:
+                        command_payload["active_chat_id"] = current_chat_id
+                        self.command_received.emit(command_payload)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -901,6 +1107,8 @@ class ConditionRow(QWidget):
     def __init__(self, data: Optional[dict] = None):
         super().__init__()
         self.latest_snapshot: Optional[DataSnapshot] = None
+        self._right_value_uses_fixed = True
+        self._last_displayed_right_value: Optional[float] = None
         self.enabled = QCheckBox("Enable")
         self.left_metric = QComboBox()
         self.left_metric.addItems([name for name, _ in METRICS])
@@ -1015,26 +1223,34 @@ class ConditionRow(QWidget):
 
     def _refresh_right_display(self) -> None:
         use_fixed_value = self._current_right_mode() == RIGHT_COMPARISON_VALUE_KEY
-        self.right_value.setReadOnly(not use_fixed_value)
-        self.right_value.setButtonSymbols(
-            QAbstractSpinBox.ButtonSymbols.UpDownArrows
-            if use_fixed_value
-            else QAbstractSpinBox.ButtonSymbols.NoButtons
-        )
+        if self._right_value_uses_fixed != use_fixed_value:
+            self.right_value.setReadOnly(not use_fixed_value)
+            self.right_value.setButtonSymbols(
+                QAbstractSpinBox.ButtonSymbols.UpDownArrows
+                if use_fixed_value
+                else QAbstractSpinBox.ButtonSymbols.NoButtons
+            )
+            self._right_value_uses_fixed = use_fixed_value
         if use_fixed_value:
+            self._last_displayed_right_value = None
             return
         if self.latest_snapshot is None:
-            prev_block = self.right_value.blockSignals(True)
-            self.right_value.setValue(0.0)
-            self.right_value.blockSignals(prev_block)
+            if self._last_displayed_right_value != 0.0:
+                prev_block = self.right_value.blockSignals(True)
+                self.right_value.setValue(0.0)
+                self.right_value.blockSignals(prev_block)
+                self._last_displayed_right_value = 0.0
             return
         try:
             value = self._metric_value_by_key(self.latest_snapshot, self._current_right_mode())
         except Exception:
             return
+        if self._last_displayed_right_value is not None and abs(self._last_displayed_right_value - value) < 1e-10:
+            return
         prev_block = self.right_value.blockSignals(True)
         self.right_value.setValue(value)
         self.right_value.blockSignals(prev_block)
+        self._last_displayed_right_value = value
 
     @classmethod
     def _cross_pair(
@@ -1106,22 +1322,26 @@ class MainWindow(QMainWindow):
         self.last_alert_ts = 0.0
         self.fetch_in_progress = False
         self.fetch_worker: Optional[FetchWorker] = None
-        self.telegram_sync_in_progress = False
-        self.telegram_sync_worker: Optional[TelegramSyncWorker] = None
+        self.telegram_poll_worker: Optional[TelegramPollWorker] = None
         self.telegram_send_workers: List[TelegramSendWorker] = []
         self.telegram_last_update_id = 0
         self.last_telegram_status_log = ""
+        self.last_market_error_log = ""
         self.telegram_chat_id = ""
+        self.telegram_bot_username = ""
         self.condition_rows: List[ConditionRow] = []
+        self._last_price_trend = 0
+        self._last_telegram_connected: Optional[bool] = None
+        self._last_telegram_status_text = ""
 
         self._build_ui()
         self._load_from_settings()
         self._connect_signals()
         self._start_timer()
         if self.token_input.text().strip():
-            self._sync_telegram_once()
+            self._start_telegram_polling()
         else:
-            self._update_telegram_status()
+            self._set_telegram_status(False, "Missing token")
         self.refresh_data()
 
     def _build_ui(self) -> None:
@@ -1373,7 +1593,7 @@ class MainWindow(QMainWindow):
         self.conditions_scroll = QScrollArea()
         self.conditions_scroll.setWidgetResizable(True)
         self.conditions_scroll.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.conditions_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.conditions_scroll.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         scroll_wrap = QWidget()
         self.conditions_container = QVBoxLayout()
         self.conditions_container.setContentsMargins(0, 4, 0, 0)
@@ -1384,16 +1604,18 @@ class MainWindow(QMainWindow):
         self.conditions_scroll.setWidget(scroll_wrap)
         conditions_layout.addWidget(self.conditions_scroll)
         self.conditions_box.setLayout(conditions_layout)
-        self._condition_row_height = 66
+        sample_condition_row = ConditionRow()
+        self._condition_row_height = max(66, sample_condition_row.sizeHint().height())
         self._condition_visible_rows = 3
         self._update_conditions_area_height()
-        fixed_h = self.conditions_box.layout().sizeHint().height() + 2
-        self.conditions_box.setFixedHeight(fixed_h)
+        self._conditions_box_fixed_height = self.conditions_box.layout().sizeHint().height() + 2
+        self.conditions_box.setFixedHeight(self._conditions_box_fixed_height)
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setPlaceholderText("Event log...")
         self.log_text.setMinimumHeight(85)
+        self.log_text.document().setMaximumBlockCount(300)
 
         top_layout = QHBoxLayout()
         top_layout.setSpacing(8)
@@ -1508,9 +1730,8 @@ class MainWindow(QMainWindow):
         if widget is not None:
             widget.adjustSize()
             widget.updateGeometry()
-        if hasattr(self, "conditions_box") and self.conditions_box.layout() is not None:
-            # Keep group box height in sync with scroll area real height to avoid overlap with log.
-            self.conditions_box.setFixedHeight(self.conditions_box.layout().sizeHint().height() + 2)
+        if hasattr(self, "_conditions_box_fixed_height"):
+            self.conditions_box.setFixedHeight(self._conditions_box_fixed_height)
             self.conditions_box.updateGeometry()
         self.conditions_scroll.updateGeometry()
 
@@ -1541,25 +1762,31 @@ class MainWindow(QMainWindow):
     def on_fetch_success(self, snapshot: DataSnapshot) -> None:
         self.previous_snapshot = self.current_snapshot
         self.current_snapshot = snapshot
-        for row in self.condition_rows:
-            row.set_snapshot(snapshot)
-        self.price_title_label.setText(f"{snapshot.symbol} Price")
-        self.price_label.setText(f"{snapshot.price:,.1f} {snapshot.quote_currency}")
-        trend = 1 if snapshot.price > snapshot.prev_close else (-1 if snapshot.price < snapshot.prev_close else 0)
-        self._set_price_trend_style(trend)
-        self.price_label.setToolTip("")
-        self.rsi_label.setText(f"{snapshot.rsi:.1f}")
-        self.ema1_label.setText(f"{snapshot.ema1:,.1f}")
-        self.ema2_label.setText(f"{snapshot.ema2:,.1f}")
-        self.ema3_label.setText(f"{snapshot.ema3:,.1f}")
-        self.ema4_label.setText(f"{snapshot.ema4:,.1f}")
-        self.volume_label.setText(f"{snapshot.volume:,.1f}")
-        self.bb_label.setText(f"{snapshot.bb_lower:,.1f} - {snapshot.bb_upper:,.1f}")
-        self.updated_at_label.setText(
-            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snapshot.timestamp_ms / 1000))
-        )
+        self.last_market_error_log = ""
+        self.setUpdatesEnabled(False)
+        try:
+            for row in self.condition_rows:
+                row.set_snapshot(snapshot)
+            self._set_label_text_if_changed(self.price_title_label, f"{snapshot.symbol} Price")
+            self._set_label_text_if_changed(self.price_label, f"{snapshot.price:,.1f} {snapshot.quote_currency}")
+            trend = 1 if snapshot.price > snapshot.prev_close else (-1 if snapshot.price < snapshot.prev_close else 0)
+            self._set_price_trend_style(trend)
+            if self.price_label.toolTip():
+                self.price_label.setToolTip("")
+            self._set_label_text_if_changed(self.rsi_label, f"{snapshot.rsi:.1f}")
+            self._set_label_text_if_changed(self.ema1_label, f"{snapshot.ema1:,.1f}")
+            self._set_label_text_if_changed(self.ema2_label, f"{snapshot.ema2:,.1f}")
+            self._set_label_text_if_changed(self.ema3_label, f"{snapshot.ema3:,.1f}")
+            self._set_label_text_if_changed(self.ema4_label, f"{snapshot.ema4:,.1f}")
+            self._set_label_text_if_changed(self.volume_label, f"{snapshot.volume:,.1f}")
+            self._set_label_text_if_changed(self.bb_label, f"{snapshot.bb_lower:,.1f} - {snapshot.bb_upper:,.1f}")
+            self._set_label_text_if_changed(
+                self.updated_at_label,
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snapshot.timestamp_ms / 1000)),
+            )
+        finally:
+            self.setUpdatesEnabled(True)
         self.evaluate_conditions()
-        self.log("Market data updated")
 
     def on_fetch_failed(self, err: str) -> None:
         if "No data source (market closed)" in err:
@@ -1567,7 +1794,30 @@ class MainWindow(QMainWindow):
             for row in self.condition_rows:
                 row.set_snapshot(None)
             self._show_no_data_state(self.symbol_input.currentText())
-        self.log(f"Fetch failed: {err}")
+            return
+        if self._is_network_error(err):
+            msg = f"Network disconnected: {err}"
+            if msg != self.last_market_error_log:
+                self.log(msg)
+                self.last_market_error_log = msg
+
+    @staticmethod
+    def _is_network_error(err: str) -> bool:
+        text = str(err or "").lower()
+        network_markers = (
+            "timeout",
+            "timed out",
+            "connection",
+            "network",
+            "dns",
+            "name or service not known",
+            "temporarily unavailable",
+            "remote end closed connection",
+            "max retries exceeded",
+            "proxy",
+            "ssl",
+        )
+        return any(marker in text for marker in network_markers)
 
     def on_save_clicked(self) -> None:
         try:
@@ -1575,12 +1825,15 @@ class MainWindow(QMainWindow):
             old_token = self.telegram_service.token
             token_changed = new_token != old_token
             if token_changed:
+                self._stop_telegram_polling(wait=True)
+            if token_changed:
                 self.telegram_chat_id = ""
                 self.telegram_last_update_id = 0
                 self.last_telegram_status_log = ""
+                self.telegram_bot_username = ""
             self.telegram_service.set_credentials(new_token, self.telegram_chat_id)
             saved_ok = self._save_settings()
-            self._sync_telegram_once()
+            self._start_telegram_polling()
             self._start_timer()
             if not saved_ok:
                 self.log("Save settings requested (not persisted)")
@@ -1591,52 +1844,62 @@ class MainWindow(QMainWindow):
 
     def on_symbol_changed(self) -> None:
         symbol = self.symbol_input.currentText()
-        self.price_title_label.setText(f"{symbol} Price")
+        self._set_label_text_if_changed(self.price_title_label, f"{symbol} Price")
         self._show_no_data_state(symbol)
         self._save_settings()
         self.refresh_data()
 
     def on_test_telegram(self) -> None:
         self.telegram_service.set_credentials(self.token_input.text(), self.telegram_chat_id)
+        if not self.token_input.text().strip():
+            self._set_telegram_status(False, "Missing token")
+            self.log("Telegram test: Missing token")
+            return
+        self._start_telegram_polling()
         if not self.telegram_chat_id.strip():
-            self._sync_telegram_once()
-            self.log("Trying to auto-detect chat_id. Please test again in a few seconds.")
+            bot_hint = f"@{self.telegram_bot_username}" if self.telegram_bot_username else "your bot"
+            self.log(f"Telegram listener is running. Send /start or /status to {bot_hint} first.")
             return
         self._send_telegram_async("Price tracker test message.", "Telegram test")
 
-    def _update_telegram_status(self) -> None:
-        self.telegram_service.set_credentials(self.token_input.text(), self.telegram_chat_id)
-        ok, msg = self.telegram_service.validate()
-        self._set_telegram_status(ok, msg)
-
-    def _sync_telegram_once(self) -> None:
+    def _start_telegram_polling(self) -> None:
         token = self.token_input.text().strip()
         if not token:
             self._set_telegram_status(False, "Missing token")
             return
-        if self.telegram_sync_in_progress:
+        if self.telegram_poll_worker is not None and self.telegram_poll_worker.isRunning():
             return
-        self.telegram_sync_in_progress = True
-        self.telegram_sync_worker = TelegramSyncWorker(
+        self.telegram_poll_worker = TelegramPollWorker(
             token=token,
             chat_id=self.telegram_chat_id,
             last_update_id=self.telegram_last_update_id,
         )
-        self.telegram_sync_worker.success.connect(self._on_telegram_sync_success)
-        self.telegram_sync_worker.failed.connect(self._on_telegram_sync_failed)
-        self.telegram_sync_worker.finished.connect(self._on_telegram_sync_finished)
-        self.telegram_sync_worker.start()
+        self.telegram_poll_worker.status.connect(self._on_telegram_poll_status)
+        self.telegram_poll_worker.command_received.connect(self._on_telegram_command_received)
+        self.telegram_poll_worker.failed.connect(self._on_telegram_poll_failed)
+        self.telegram_poll_worker.finished.connect(self._on_telegram_poll_finished)
+        self.telegram_poll_worker.start()
 
-    def _on_telegram_sync_finished(self) -> None:
-        self.telegram_sync_in_progress = False
-        self.telegram_sync_worker = None
+    def _stop_telegram_polling(self, *, wait: bool = False) -> None:
+        worker = self.telegram_poll_worker
+        if worker is None:
+            return
+        worker.stop()
+        if wait and worker.isRunning():
+            worker.wait((TelegramPollWorker.LONG_POLL_TIMEOUT_SEC + 5) * 1000)
 
-    def _on_telegram_sync_success(self, result: object) -> None:
+    def _on_telegram_poll_finished(self) -> None:
+        self.telegram_poll_worker = None
+
+    def _on_telegram_poll_status(self, result: object) -> None:
         try:
             if not isinstance(result, dict):
                 return
             self.telegram_last_update_id = int(result.get("last_update_id", self.telegram_last_update_id))
             new_chat_id = str(result.get("chat_id", "") or "")
+            bot_username = str(result.get("bot_username", "") or "").strip()
+            if bot_username:
+                self.telegram_bot_username = bot_username
             if new_chat_id and not self.telegram_chat_id:
                 self.telegram_chat_id = new_chat_id
                 self.telegram_service.set_credentials(self.token_input.text(), new_chat_id)
@@ -1659,40 +1922,108 @@ class MainWindow(QMainWindow):
                 self.log(f"Telegram status: {status}")
                 self.last_telegram_status_log = status
         except Exception as exc:
-            self._set_telegram_status(False, "Telegram sync failed")
-            self.log(f"Telegram sync handling failed ({type(exc).__name__}): {exc}")
+            self._set_telegram_status(False, "Telegram listener failed")
+            self.log(f"Telegram listener handling failed ({type(exc).__name__}): {exc}")
 
-    def _on_telegram_sync_failed(self, err: str) -> None:
-        msg = f"Telegram sync error: {err}"
+    def _on_telegram_poll_failed(self, err: str) -> None:
+        msg = f"Telegram listener error: {err}"
         self._set_telegram_status(False, msg)
         if msg != self.last_telegram_status_log:
             self.log(msg)
             self.last_telegram_status_log = msg
 
+    def _on_telegram_command_received(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+
+        command = str(payload.get("command", "") or "").strip().lower()
+        reply_chat_id = str(payload.get("chat_id", "") or "").strip()
+        if not reply_chat_id:
+            return
+
+        if not self.telegram_chat_id and bool(payload.get("is_private", False)):
+            self.telegram_chat_id = reply_chat_id
+            self.telegram_service.set_credentials(self.token_input.text(), self.telegram_chat_id)
+            self._save_settings()
+
+        if command == "/status":
+            self._send_telegram_async(
+                self._format_status_message(),
+                "Telegram command /status",
+                chat_id=reply_chat_id,
+            )
+            return
+
+        if command == "/condition":
+            self._send_telegram_async(
+                self._format_conditions_message(),
+                "Telegram command /condition",
+                chat_id=reply_chat_id,
+            )
+            return
+
+        if command == "/start":
+            first_name = str(payload.get("first_name", "") or "").strip()
+            greeting = f"Hi {first_name}.\n" if first_name else "Price Tracker bot is online.\n"
+            self._send_telegram_async(
+                (
+                    f"{greeting}"
+                    "Available commands:\n"
+                    "/status - show current price and indicators\n"
+                    "/condition - show enabled monitor conditions"
+                ),
+                "Telegram command /start",
+                chat_id=reply_chat_id,
+            )
+            return
+
+        self._send_telegram_async(
+            (
+                "Unknown command.\n"
+                "Available commands:\n"
+                "/status - show current price and indicators\n"
+                "/condition - show enabled monitor conditions"
+            ),
+            f"Telegram command {command}",
+            chat_id=reply_chat_id,
+        )
+
+    @staticmethod
+    def _set_label_text_if_changed(label: QLabel, text: str) -> None:
+        if label.text() != text:
+            label.setText(text)
+
     def _set_telegram_status(self, connected: bool, text: str) -> None:
-        self.telegram_status_label.setText(text)
-        if connected:
-            self.telegram_status_label.setStyleSheet("color: white; background: #228b22; padding: 4px 8px;")
-        else:
-            self.telegram_status_label.setStyleSheet("color: white; background: #8b0000; padding: 4px 8px;")
+        self._set_label_text_if_changed(self.telegram_status_label, text)
+        if self._last_telegram_connected == connected and self._last_telegram_status_text == text:
+            return
+        if self._last_telegram_connected != connected:
+            if connected:
+                self.telegram_status_label.setStyleSheet("color: white; background: #228b22; padding: 4px 8px;")
+            else:
+                self.telegram_status_label.setStyleSheet("color: white; background: #8b0000; padding: 4px 8px;")
+            self._last_telegram_connected = connected
+        self._last_telegram_status_text = text
 
     def _set_price_trend_style(self, trend: int) -> None:
+        if self._last_price_trend == trend:
+            return
         if trend > 0:
             self.price_label.setStyleSheet(
                 "font-size: 28px; font-weight: 800; color: #e8ffe8; "
                 "background: #1f7a35; border: 1px solid #4ca868; border-radius: 6px; padding: 6px 10px;"
             )
-            return
-        if trend < 0:
+        elif trend < 0:
             self.price_label.setStyleSheet(
                 "font-size: 28px; font-weight: 800; color: #ffe8e8; "
                 "background: #8f2e2e; border: 1px solid #c55a5a; border-radius: 6px; padding: 6px 10px;"
             )
-            return
-        self.price_label.setStyleSheet(
-            "font-size: 28px; font-weight: 800; color: #f2f2f2; "
-            "background: #2f2f2f; border: 1px solid #676767; border-radius: 6px; padding: 6px 10px;"
-        )
+        else:
+            self.price_label.setStyleSheet(
+                "font-size: 28px; font-weight: 800; color: #f2f2f2; "
+                "background: #2f2f2f; border: 1px solid #676767; border-radius: 6px; padding: 6px 10px;"
+            )
+        self._last_price_trend = trend
 
     def evaluate_conditions(self) -> None:
         if not self.current_snapshot:
@@ -1737,27 +2068,89 @@ class MainWindow(QMainWindow):
 
     def _show_no_data_state(self, symbol: Optional[str] = None) -> None:
         if symbol:
-            self.price_title_label.setText(f"{symbol} Price")
-        self.price_label.setText("-")
+            self._set_label_text_if_changed(self.price_title_label, f"{symbol} Price")
+        self._set_label_text_if_changed(self.price_label, "-")
         self._set_price_trend_style(0)
-        self.rsi_label.setText("-")
-        self.ema1_label.setText("-")
-        self.ema2_label.setText("-")
-        self.ema3_label.setText("-")
-        self.ema4_label.setText("-")
-        self.volume_label.setText("-")
-        self.bb_label.setText("-")
-        self.updated_at_label.setText("-")
+        self._set_label_text_if_changed(self.rsi_label, "-")
+        self._set_label_text_if_changed(self.ema1_label, "-")
+        self._set_label_text_if_changed(self.ema2_label, "-")
+        self._set_label_text_if_changed(self.ema3_label, "-")
+        self._set_label_text_if_changed(self.ema4_label, "-")
+        self._set_label_text_if_changed(self.volume_label, "-")
+        self._set_label_text_if_changed(self.bb_label, "-")
+        self._set_label_text_if_changed(self.updated_at_label, "-")
 
-    def _send_telegram_async(self, text: str, context: str) -> bool:
+    def _format_status_message(self) -> str:
+        snapshot = self.current_snapshot
+        if snapshot is None:
+            symbol = self.symbol_input.currentText()
+            return (
+                f"[{symbol} Status]\n"
+                f"Symbol: {symbol}\n"
+                "Status: No market snapshot yet\n"
+                "Tip: wait for the next refresh or press Manual Refresh."
+            )
+
+        timeframe = self.timeframe_input.currentText()
+        updated_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(snapshot.timestamp_ms / 1000))
+        return (
+            f"[{snapshot.symbol} Status]\n"
+            f"Symbol: {snapshot.symbol}\n"
+            f"Timeframe: {timeframe}\n"
+            f"Price: {snapshot.price:.1f} {snapshot.quote_currency}\n"
+            f"RSI: {snapshot.rsi:.1f}\n"
+            f"EMA1/2/3/4: {snapshot.ema1:.1f} / {snapshot.ema2:.1f} / {snapshot.ema3:.1f} / {snapshot.ema4:.1f}\n"
+            f"Volume: {snapshot.volume:.1f}\n"
+            f"BB: {snapshot.bb_lower:.1f} - {snapshot.bb_upper:.1f}\n"
+            f"Updated: {updated_at}"
+        )
+
+    def _format_conditions_message(self) -> str:
+        symbol = self.symbol_input.currentText()
+        timeframe = self.timeframe_input.currentText()
+        enabled_rows = [row for row in self.condition_rows if row.is_enabled()]
+        total_rows = len(self.condition_rows)
+
+        if not total_rows:
+            return (
+                f"[{symbol} Conditions]\n"
+                f"Symbol: {symbol}\n"
+                f"Timeframe: {timeframe}\n"
+                "Status: No conditions configured"
+            )
+
+        if not enabled_rows:
+            return (
+                f"[{symbol} Conditions]\n"
+                f"Symbol: {symbol}\n"
+                f"Timeframe: {timeframe}\n"
+                f"Configured: {total_rows}\n"
+                "Enabled: 0\n"
+                "Status: All conditions are currently disabled"
+            )
+
+        lines = [
+            f"[{symbol} Conditions]",
+            f"Symbol: {symbol}",
+            f"Timeframe: {timeframe}",
+            f"Configured: {total_rows}",
+            f"Enabled: {len(enabled_rows)}",
+            f"Cooldown: {self.cooldown_input.value()} sec",
+            "Monitoring:",
+        ]
+        for idx, row in enumerate(enabled_rows, start=1):
+            lines.append(f"{idx}. {row.description()}")
+        return "\n".join(lines)
+
+    def _send_telegram_async(self, text: str, context: str, *, chat_id: Optional[str] = None) -> bool:
         token = self.token_input.text().strip()
-        chat_id = self.telegram_chat_id.strip()
-        if not token or not chat_id:
+        target_chat_id = str(chat_id or self.telegram_chat_id).strip()
+        if not token or not target_chat_id:
             self._set_telegram_status(False, "Missing token or chat ID")
             self.log(f"{context}: Missing token or chat ID")
             return False
 
-        worker = TelegramSendWorker(token, chat_id, text, context)
+        worker = TelegramSendWorker(token, target_chat_id, text, context)
         self.telegram_send_workers.append(worker)
         worker.success.connect(lambda payload, w=worker: self._on_telegram_send_success(w, payload))
         worker.failed.connect(lambda err, w=worker, c=context: self._on_telegram_send_failed(w, c, err))
@@ -1785,12 +2178,13 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         if hasattr(self, "timer"):
             self.timer.stop()
+        self._stop_telegram_polling()
 
         workers: List[QThread] = []
         if self.fetch_worker is not None:
             workers.append(self.fetch_worker)
-        if self.telegram_sync_worker is not None:
-            workers.append(self.telegram_sync_worker)
+        if self.telegram_poll_worker is not None:
+            workers.append(self.telegram_poll_worker)
         workers.extend(self.telegram_send_workers)
 
         for worker in workers:
