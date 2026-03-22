@@ -97,7 +97,7 @@ install_build_deps() {
   fi
   "$VENV_DIR/bin/python" -m pip install --upgrade pip setuptools wheel
   echo "[INFO] Installing build dependencies into venv..."
-  "$VENV_DIR/bin/pip" install -r "$ROOT_DIR/requirements.txt" pyinstaller
+  "$VENV_DIR/bin/python" -m pip install -r "$ROOT_DIR/requirements.txt" pyinstaller
 }
 
 scrub_sensitive_files() {
