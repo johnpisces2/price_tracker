@@ -285,8 +285,11 @@ def _is_writable_dir(path: Path) -> bool:
 
 
 def _default_config_path() -> Path:
-    # Prefer local folder for packaged app; fallback to user profile dir if not writable.
+    # On macOS, packaged apps should avoid Desktop/Applications writes and use
+    # Application Support directly to sidestep Finder/TCC permission prompts.
     if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            return _user_fallback_config_dir() / "settings.json"
         local_dir = _frozen_local_config_dir()
         if _is_writable_dir(local_dir):
             return local_dir / "settings.json"
